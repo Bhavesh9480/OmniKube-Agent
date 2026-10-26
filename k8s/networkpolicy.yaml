@@ -1,0 +1,37 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: k8s-monitoring-agent-netpol
+  namespace: default
+  labels:
+    app.kubernetes.io/name: k8s-monitoring-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: k8s-monitoring-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow ingress on port 9999 only from designated ingress controllers or authorized dashboard namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: remote-dashboard
+      ports:
+        - protocol: TCP
+          port: 9999
+  egress:
+    # Allow egress to Kubernetes API server (port 443 / 6443) and DNS (port 53)
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

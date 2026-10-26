@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-monitoring-agent
+  namespace: default
+  labels:
+    app.kubernetes.io/name: k8s-monitoring-agent
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: cluster-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k8s-monitoring-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k8s-monitoring-agent
+        app.kubernetes.io/component: monitoring
+    spec:
+      serviceAccountName: k8s-monitoring-agent
+      automountServiceAccountToken: true
+
+      # Strict scheduling: Enforce placement ONLY on master/control-plane node
+      # Does not silently fall back to worker nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/master
+                    operator: Exists
+              - matchExpressions:
+                  - key: minikube.k8s.io/primary
+                    operator: Exists
+
+      # Tolerations necessary for control-plane taints
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+
+      # Pod-level security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: agent
+          image: k8s-monitoring-agent:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn"]
+          args: ["app.main:app", "--host", "0.0.0.0", "--port", "9999"]
+
+          # Container-level security hardening
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+          env:
+            - name: APP_MODE
+              value: "production"
+            - name: PORT
+              value: "9999"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PENDING_POD_THRESHOLD_SECONDS
+              value: "300"
+            - name: CRASH_LOOP_RESTART_THRESHOLD
+              value: "3"
+            - name: CACHE_STALE_THRESHOLD_SECONDS
+              value: "120"
+
+          ports:
+            - name: http
+              containerPort: 9999
+              protocol: TCP
+
+          # Resource allocation within 256Mi - 512Mi target budget
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          # Liveness probe (process alive check)
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness probe (API reachable, initial sync complete, cache fresh)
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          volumeMounts:
+            - name: tmp-dir
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp-dir
+          emptyDir:
+            medium: Memory
