@@ -384,3 +384,5 @@ Settings can be overridden using environment variables or a `.env` file:
 ## License
 
 This project is licensed under the Apache 2.0 License — see the [LICENSE](LICENSE) file for details.
+Copyright (c) 2026 Bhavesh Suthar. All rights reserved.
+
