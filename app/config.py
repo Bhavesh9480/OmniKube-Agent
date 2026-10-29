@@ -1,6 +1,6 @@
 """Configuration management for the Kubernetes Monitoring Agent."""
 
-from typing import List, Literal
+from typing import List, Literal, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -50,6 +50,56 @@ class Settings(BaseSettings):
         default=60,
         description="Interval in seconds for full cluster reconciliation loops",
     )
+
+    # Tier 1 Lightweight Enhancements
+    enable_metrics_server: bool = Field(
+        default=True,
+        description="Query native metrics.k8s.io for live CPU/RAM if available",
+    )
+    enable_crash_logs: bool = Field(
+        default=True,
+        description="Auto-fetch tail logs on container crash/failure",
+    )
+    crash_log_tail_lines: int = Field(
+        default=20,
+        description="Lines of logs to fetch from crashed containers",
+    )
+    alert_webhook_url: Optional[str] = Field(
+        default=None,
+        description="Incoming webhook URL for Slack, Discord, or generic HTTP POST alerts",
+    )
+    alert_flapping_cooldown_seconds: int = Field(
+        default=0,
+        description="Cooldown seconds before auto-resolving an alert to prevent flapping (0 = immediate)",
+    )
+
+    # Tier 2 Production & Multi-Tenancy Settings
+    watch_namespaces: Optional[str] = Field(
+        default=None,
+        description="Comma-separated namespaces to monitor (e.g. 'prod,stage'). If empty, monitors cluster-wide.",
+    )
+    enable_leader_election: bool = Field(
+        default=False,
+        description="Enable Kubernetes Lease-based leader election for HA multi-replica deployments",
+    )
+    leader_election_lease_name: str = Field(
+        default="omnikube-agent-leader",
+        description="Name of the coordination.k8s.io Lease object",
+    )
+    leader_election_namespace: str = Field(
+        default="default",
+        description="Namespace hosting the leader election lease",
+    )
+    leader_election_lease_duration_seconds: int = Field(
+        default=15,
+        description="Lease validity duration in seconds",
+    )
+
+    def get_monitored_namespaces(self) -> List[str]:
+        """Return list of explicit namespaces to watch, or empty list if cluster-wide."""
+        if not self.watch_namespaces:
+            return []
+        return [ns.strip() for ns in self.watch_namespaces.split(",") if ns.strip()]
 
     # Security settings
     cors_allowed_origins: List[str] = Field(

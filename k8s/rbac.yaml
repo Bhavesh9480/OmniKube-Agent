@@ -6,21 +6,24 @@ metadata:
     app.kubernetes.io/name: k8s-monitoring-agent
     app.kubernetes.io/component: monitoring
 rules:
-  # Core API group: read-only access to pods, services, and events
+  # Core API group: read-only access to pods, services, events, nodes, and PVCs
   - apiGroups: [""]
     resources:
       - pods
       - services
       - events
+      - nodes
+      - persistentvolumeclaims
     verbs:
       - get
       - list
       - watch
 
-  # Apps API group: read-only access to deployments
+  # Apps API group: read-only access to deployments and statefulsets
   - apiGroups: ["apps"]
     resources:
       - deployments
+      - statefulsets
     verbs:
       - get
       - list
@@ -34,6 +37,33 @@ rules:
       - get
       - list
       - watch
+
+  # Coordination API group: access to leases for leader election HA
+  - apiGroups: ["coordination.k8s.io"]
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+
+  # Core API subresource: read-only access to pod logs for crash diagnostics
+  - apiGroups: [""]
+    resources:
+      - pods/log
+    verbs:
+      - get
+
+  # Metrics Server API group: read-only access to live CPU and memory utilization
+  - apiGroups: ["metrics.k8s.io"]
+    resources:
+      - pods
+      - nodes
+    verbs:
+      - get
+      - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

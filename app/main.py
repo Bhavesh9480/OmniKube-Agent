@@ -52,6 +52,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     loop = asyncio.get_running_loop()
     broadcaster.start_heartbeat(loop)
 
+    # Start leader election if enabled
+    from app.leader import leader_manager
+    leader_manager.start()
+
     # Start watchers or mock simulation
     cluster_watcher.start()
 
@@ -61,6 +65,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Shutting down Kubernetes Monitoring Agent...")
     broadcaster.stop_heartbeat()
     cluster_watcher.stop()
+    leader_manager.stop()
 
 
 app = FastAPI(

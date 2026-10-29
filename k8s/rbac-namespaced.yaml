@@ -1,0 +1,76 @@
+# RBAC for scoped namespace monitoring without ClusterRole privileges.
+# Deploy this Role and RoleBinding into each namespace configured in WATCH_NAMESPACES.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8s-monitoring-agent-namespaced
+  namespace: default
+  labels:
+    app.kubernetes.io/name: k8s-monitoring-agent
+    app.kubernetes.io/component: monitoring
+rules:
+  # Core API group: read-only access to pods, services, events, and pvcs
+  - apiGroups: [""]
+    resources:
+      - pods
+      - services
+      - events
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+      - watch
+
+  # Apps API group: read-only access to deployments and statefulsets
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+    verbs:
+      - get
+      - list
+      - watch
+
+  # Discovery API group: read-only access to endpointslices
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs:
+      - get
+      - list
+      - watch
+
+  # Core API subresource: read-only access to pod logs for crash diagnostics
+  - apiGroups: [""]
+    resources:
+      - pods/log
+    verbs:
+      - get
+
+  # Coordination API group: leases for leader election within agent namespace
+  - apiGroups: ["coordination.k8s.io"]
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-monitoring-agent-namespaced-binding
+  namespace: default
+  labels:
+    app.kubernetes.io/name: k8s-monitoring-agent
+    app.kubernetes.io/component: monitoring
+subjects:
+  - kind: ServiceAccount
+    name: k8s-monitoring-agent
+    namespace: default
+roleRef:
+  kind: Role
+  name: k8s-monitoring-agent-namespaced
+  apiGroup: rbac.authorization.k8s.io

@@ -18,6 +18,10 @@ class ResourceCache:
         self._services: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._endpointslices: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._events: List[Dict[str, Any]] = []
+        self._pod_metrics: Dict[str, Dict[str, Any]] = {}
+        self._nodes: Dict[str, Dict[str, Any]] = {}
+        self._statefulsets: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._pvcs: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
         # Synchronization metadata
         self._last_sync_time: Dict[str, datetime] = {}
@@ -196,6 +200,46 @@ class ResourceCache:
         last_sync = self.get_last_successful_sync()
         self._broadcast(lambda b: b.broadcast_sync_status("synchronized" if completed else "syncing", last_sync.isoformat() if last_sync else None))
 
+    # --- Live Pod Metrics (metrics.k8s.io) ---
+    def set_pod_metrics(self, metrics: Dict[str, Dict[str, Any]]) -> None:
+        with self._lock:
+            self._pod_metrics = dict(metrics)
+
+    def get_pod_metrics(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return dict(self._pod_metrics)
+
+    def get_pod_metric(self, namespace: str, name: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self._pod_metrics.get(f"{namespace}/{name}")
+
+    # --- Nodes (Tier 2) ---
+    def set_nodes(self, nodes: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self._nodes = {n["name"]: n for n in nodes}
+
+    def get_nodes(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._nodes.values())
+
+    # --- StatefulSets (Tier 2) ---
+    def set_statefulsets(self, statefulsets: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self._statefulsets = {(s["namespace"], s["name"]): s for s in statefulsets}
+
+    def get_statefulsets(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._statefulsets.values())
+
+    # --- PersistentVolumeClaims (Tier 2) ---
+    def set_pvcs(self, pvcs: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self._pvcs = {(p["namespace"], p["name"]): p for p in pvcs}
+
+    def get_pvcs(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._pvcs.values())
+
     def is_initial_sync_completed(self) -> bool:
         with self._lock:
             return self._initial_sync_completed
@@ -228,6 +272,9 @@ class ResourceCache:
                 "services_count": len(self._services),
                 "endpointslices_count": len(self._endpointslices),
                 "events_count": len(self._events),
+                "nodes_count": len(self._nodes),
+                "statefulsets_count": len(self._statefulsets),
+                "pvcs_count": len(self._pvcs),
                 "initial_sync_completed": self._initial_sync_completed,
                 "overall_last_sync": self._overall_last_sync.isoformat() if self._overall_last_sync else None,
                 "sync_errors": dict(self._sync_errors),
@@ -240,6 +287,10 @@ class ResourceCache:
             self._services.clear()
             self._endpointslices.clear()
             self._events.clear()
+            self._pod_metrics.clear()
+            self._nodes.clear()
+            self._statefulsets.clear()
+            self._pvcs.clear()
             self._last_sync_time.clear()
             self._overall_last_sync = None
             self._initial_sync_completed = False

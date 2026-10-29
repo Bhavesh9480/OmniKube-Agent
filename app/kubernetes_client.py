@@ -39,6 +39,8 @@ class KubernetesClientManager:
         self.core_v1: Optional[Any] = None
         self.apps_v1: Optional[Any] = None
         self.discovery_v1: Optional[Any] = None
+        self.custom_objects: Optional[Any] = None
+        self.coordination_v1: Optional[Any] = None
 
     def initialize(self) -> Tuple[bool, Optional[str]]:
         """Initialize the client according to the configured mode.
@@ -107,6 +109,20 @@ class KubernetesClientManager:
         self.core_v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
         self.discovery_v1 = client.DiscoveryV1Api()
+        self.custom_objects = client.CustomObjectsApi()
+        self.coordination_v1 = client.CoordinationV1Api()
+
+    def get_coordination_v1(self) -> Optional[Any]:
+        """Return CoordinationV1Api instance if connected."""
+        return self.coordination_v1
+
+    def get_custom_objects(self) -> Optional[Any]:
+        """Return CustomObjectsApi instance if connected."""
+        return self.custom_objects
+
+    def get_core_v1(self) -> Optional[Any]:
+        """Return CoreV1Api instance if connected."""
+        return self.core_v1
 
     def get_status(self) -> Dict[str, Any]:
         """Return connectivity status dictionary."""

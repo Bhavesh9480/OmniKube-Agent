@@ -3,7 +3,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes%20Client-v29+-326ce5.svg?logo=kubernetes&logoColor=white)](https://github.com/kubernetes-client/python)
-[![Tests](https://img.shields.io/badge/Tests-37%20Passed-brightgreen.svg)](#test-execution)
+[![Tests](https://img.shields.io/badge/Tests-60%20Passed-brightgreen.svg)](#test-execution)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 A lightweight, enterprise-grade Kubernetes cluster monitoring agent built with **Python 3.12**, **FastAPI**, and the official **Kubernetes Python client**. 
@@ -65,6 +65,9 @@ A lightweight, enterprise-grade Kubernetes cluster monitoring agent built with *
    - **Pods**: Parses container states (Running, Waiting, Terminated), exit codes, restart counts, and accurately detects `CrashLoopBackOff`, `ImagePullBackOff`, `ErrImagePull`, `CreateContainerError`, `ProlongedPending` (>300s), and terminating pods. Does not assume a Running pod is healthy.
    - **Deployments**: Tracks desired vs. available replicas, stale observed generations, progress failures (`ProgressDeadlineExceeded`), and handles zero-replica deployments (`desired == 0`) cleanly as healthy.
    - **Services & EndpointSlices**: Associates Services with DiscoveryV1 `EndpointSlice` resources by `kubernetes.io/service-name` label; detects selector-backed services lacking ready endpoints while preserving headless/external services.
+   - **Nodes**: Inspects node conditions (`Ready`, `MemoryPressure`, `DiskPressure`, `PIDPressure`), kubelet versions, internal IPs, and allocatable capacity (CPU/RAM/Pods).
+   - **StatefulSets**: Tracks desired vs. ready/updated replicas, immediately detecting replica shortages (`StatefulSetReplicaShortage`).
+   - **PersistentVolumeClaims (PVCs)**: Monitored storage claims, identifying stuck `Pending` volume bindings and broken `Lost` volume associations.
    - **Events**: Collects recent `Normal` and `Warning` Kubernetes events for diagnostic context.
 
 4. **Deterministic Alert Engine (`app/alerts.py`)**:
@@ -306,8 +309,12 @@ All endpoints run on port `9999` and return structured JSON validated via Pydant
 | `GET` | `/api/deployments`| Monitored deployments. Query params: `namespace`, `attention`. |
 | `GET` | `/api/services` | Monitored services with associated EndpointSlice health. |
 | `GET` | `/api/endpointslices`| Raw EndpointSlice network topology. |
+| `GET` | `/api/nodes` | Monitored cluster nodes with pressure conditions & allocatable capacity. Query param: `attention`. |
+| `GET` | `/api/statefulsets` | Monitored StatefulSets with replica shortages. Query params: `namespace`, `attention`. |
+| `GET` | `/api/pvcs` | Monitored PersistentVolumeClaims. Query params: `namespace`, `phase`, `attention`. |
 | `GET` | `/api/events` | Recent cluster-wide diagnostic events (`Warning` / `Normal`). |
 | `GET` | `/api/alerts` | Active and resolved alert feed. Query params: `severity`, `namespace`, `limit`. |
+| `GET` | `/api/metrics/pods`| Live container CPU (millicores) and Memory (bytes) metrics from `metrics.k8s.io`. |
 | `GET` | `/api/metrics` | Lightweight in-memory agent cache metrics. |
 | `WS` | `/api/stream` | Full-duplex WebSocket streaming snapshots, live resource diffs, and heartbeats. |
 | `GET` | `/healthz` | Process liveness probe (`200 OK`). |
@@ -377,7 +384,42 @@ Settings can be overridden using environment variables or a `.env` file:
 | `CRASH_LOOP_RESTART_THRESHOLD` | `3` | Restart threshold before an alert is raised. |
 | `CACHE_STALE_THRESHOLD_SECONDS` | `120` | Max cache age before readiness probe flags data as stale. |
 | `RECONCILIATION_INTERVAL_SECONDS` | `60` | Full periodic reconciliation sweep interval. |
+| `ENABLE_METRICS_SERVER` | `true` | Query native `metrics.k8s.io` for live CPU/RAM utilization. |
+| `ENABLE_CRASH_LOGS` | `true` | Auto-capture last log lines when a container crashes or terminates. |
+| `CRASH_LOG_TAIL_LINES` | `20` | Number of crash log lines to attach to the alert payload. |
+| `ALERT_WEBHOOK_URL` | `None` | Webhook URL for real-time Slack, Discord, or generic HTTP POST alerts. |
+| `ALERT_FLAPPING_COOLDOWN_SECONDS` | `0` | Cooldown seconds before auto-resolving an alert to prevent alert flapping. |
+| `WATCH_NAMESPACES` | `""` | Comma-separated namespaces to monitor (e.g. `default,prod`). Empty string monitors cluster-wide. |
+| `ENABLE_LEADER_ELECTION` | `false` | High Availability native Kubernetes Lease leader election (`coordination.k8s.io/v1`). |
+| `LEADER_ELECTION_LEASE_NAME` | `omnikube-agent-leader` | Name of the Lease resource for HA coordination. |
+| `LEADER_ELECTION_NAMESPACE` | `default` | Namespace hosting the HA leader election lease. |
+| `LEADER_ELECTION_LEASE_DURATION_SECONDS` | `15` | Lease validity duration before failover. |
 | `CORS_ALLOWED_ORIGINS` | `[]` | Allowed origins list for browser security. |
+
+---
+
+## Enterprise Helm Chart Deployment
+
+Deploy OmniKube Agent with a single command using the bundled production Helm chart:
+
+```bash
+# Cluster-wide deployment (default)
+helm install omnikube-agent ./charts/omnikube-agent \
+  --namespace default \
+  --set config.appMode=production
+
+# High Availability (HA) Multi-Replica mode with Native Lease Leader Election
+helm install omnikube-agent ./charts/omnikube-agent \
+  --namespace default \
+  --set replicaCount=2 \
+  --set config.leaderElection.enabled=true
+
+# Scoped Multi-Namespace deployment (No ClusterRole required)
+helm install omnikube-agent ./charts/omnikube-agent \
+  --namespace default \
+  --set rbac.clusterWide=false \
+  --set config.watchNamespaces="default,production"
+```
 
 ---
 

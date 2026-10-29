@@ -20,6 +20,10 @@ from app.api.schemas import (
     EventsListResponse,
     LivenessResponse,
     MetricsStatusResponse,
+    NodeItem,
+    NodesListResponse,
+    PVCItem,
+    PVCsListResponse,
     PodItem,
     PodsListResponse,
     PodsSummary,
@@ -27,6 +31,8 @@ from app.api.schemas import (
     ServiceItem,
     ServicesListResponse,
     ServicesSummary,
+    StatefulSetItem,
+    StatefulSetsListResponse,
     SummaryResponse,
 )
 from app.broadcaster import broadcaster
@@ -79,20 +85,46 @@ def get_summary() -> SummaryResponse:
         withoutReadyEndpoints=sum(1 for s in services if s.get("withoutReadyEndpoints")),
     )
 
+    nodes = resource_cache.get_nodes()
+    sts_list = resource_cache.get_statefulsets()
+    pvcs = resource_cache.get_pvcs()
+
+    unhealthy_nodes = sum(1 for n in nodes if not n.get("isHealthy"))
+    unhealthy_sts = sum(1 for s in sts_list if not s.get("isHealthy"))
+    unhealthy_pvcs = sum(1 for p in pvcs if not p.get("isHealthy"))
+
     # Compute overall status
     if not is_connected:
         overall_status = "critical" if settings.app_mode == "production" else "unknown"
-    elif alert_counts["critical"] > 0 or pod_summary.failed > 0:
+    elif alert_counts["critical"] > 0 or pod_summary.failed > 0 or unhealthy_nodes > 0:
         overall_status = "critical"
     elif (
         alert_counts["warning"] > 0
         or pod_summary.unhealthy > 0
         or dep_summary.unhealthy > 0
         or svc_summary.withoutReadyEndpoints > 0
+        or unhealthy_sts > 0
+        or unhealthy_pvcs > 0
     ):
         overall_status = "warning"
     else:
         overall_status = "healthy"
+
+    # Aggregate live CPU/RAM metrics if available
+    pod_metrics = resource_cache.get_pod_metrics()
+    live_metrics_data = None
+    if pod_metrics:
+        total_cpu = sum(m.get("cpuMillicores", 0) for m in pod_metrics.values())
+        total_mem = sum(m.get("memoryBytes", 0) for m in pod_metrics.values())
+        from app.collectors.metrics import format_memory_bytes
+        live_metrics_data = {
+            "available": True,
+            "monitoredPodsCount": len(pod_metrics),
+            "totalCpuMillicores": total_cpu,
+            "totalCpuFormatted": f"{total_cpu}m",
+            "totalMemoryBytes": total_mem,
+            "totalMemoryFormatted": format_memory_bytes(total_mem),
+        }
 
     return SummaryResponse(
         status=overall_status,
@@ -104,6 +136,7 @@ def get_summary() -> SummaryResponse:
         deployments=dep_summary,
         services=svc_summary,
         alerts=AlertsSummary(**alert_counts),
+        liveMetrics=live_metrics_data,
     )
 
 
@@ -154,6 +187,12 @@ def get_pods(
     if limit is not None and len(pods) > limit:
         next_token = str(offset + limit)
         pods = pods[:limit]
+
+    for p in pods:
+        if not p.get("metrics"):
+            m = resource_cache.get_pod_metric(p.get("namespace", "default"), p.get("name", ""))
+            if m:
+                p["metrics"] = m
 
     items = [PodItem(**p) for p in pods]
     return PodsListResponse(items=items, count=len(items), continueToken=next_token)
@@ -341,10 +380,126 @@ def get_events(
 )
 def get_metrics_status() -> MetricsStatusResponse:
     """Explicitly verify whether real cluster metrics collection is configured."""
+    pod_metrics = resource_cache.get_pod_metrics()
+    if pod_metrics:
+        return MetricsStatusResponse(
+            configured=True,
+            source="metrics.k8s.io/v1beta1",
+            message=f"Native Kubernetes metrics-server active. Collecting live CPU and memory metrics for {len(pod_metrics)} pods.",
+        )
     return MetricsStatusResponse(
         configured=False,
         source=None,
         message="Metrics source not configured. Kubernetes metrics-server or Prometheus integration is required to collect CPU, memory, and network metrics.",
+    )
+
+
+@router.get(
+    "/api/metrics/pods",
+    summary="Get live container CPU and Memory metrics from metrics.k8s.io",
+    tags=["Monitoring"],
+)
+def get_pod_metrics_endpoint():
+    """Return live container CPU and Memory metrics collected from metrics.k8s.io."""
+    metrics = resource_cache.get_pod_metrics()
+    return {
+        "source": "metrics.k8s.io/v1beta1",
+        "count": len(metrics),
+        "available": len(metrics) > 0,
+        "items": metrics,
+    }
+
+
+@router.get(
+    "/api/nodes",
+    response_model=NodesListResponse,
+    summary="List Kubernetes nodes with conditions, pressures, and allocatable capacity",
+    tags=["Monitoring"],
+)
+def get_nodes(
+    attention: Optional[bool] = Query(None, description="Filter for unready nodes or nodes with pressures"),
+) -> NodesListResponse:
+    """Return monitored Kubernetes node status across the cluster."""
+    nodes = resource_cache.get_nodes()
+
+    if attention is not None:
+        if attention:
+            nodes = [n for n in nodes if not n.get("isHealthy")]
+        else:
+            nodes = [n for n in nodes if n.get("isHealthy")]
+
+    last_sync = resource_cache.get_last_successful_sync()
+    items = [NodeItem(**n) for n in nodes]
+    return NodesListResponse(
+        items=items,
+        count=len(items),
+        lastUpdated=last_sync.isoformat() if last_sync else None,
+    )
+
+
+@router.get(
+    "/api/statefulsets",
+    response_model=StatefulSetsListResponse,
+    summary="List StatefulSets with replica status and shortage detection",
+    tags=["Monitoring"],
+)
+def get_statefulsets(
+    namespace: Optional[str] = Query(None, description="Filter by namespace"),
+    attention: Optional[bool] = Query(None, description="Filter for StatefulSets with replica shortages"),
+) -> StatefulSetsListResponse:
+    """Return monitored StatefulSets across namespaces."""
+    sts_list = resource_cache.get_statefulsets()
+
+    if namespace:
+        sts_list = [s for s in sts_list if s.get("namespace") == namespace]
+
+    if attention is not None:
+        if attention:
+            sts_list = [s for s in sts_list if not s.get("isHealthy")]
+        else:
+            sts_list = [s for s in sts_list if s.get("isHealthy")]
+
+    last_sync = resource_cache.get_last_successful_sync()
+    items = [StatefulSetItem(**s) for s in sts_list]
+    return StatefulSetsListResponse(
+        items=items,
+        count=len(items),
+        lastUpdated=last_sync.isoformat() if last_sync else None,
+    )
+
+
+@router.get(
+    "/api/pvcs",
+    response_model=PVCsListResponse,
+    summary="List PersistentVolumeClaims with binding status and capacity",
+    tags=["Monitoring"],
+)
+def get_pvcs(
+    namespace: Optional[str] = Query(None, description="Filter by namespace"),
+    phase: Optional[str] = Query(None, description="Filter by PVC phase (Bound, Pending, Lost)"),
+    attention: Optional[bool] = Query(None, description="Filter for PVCs with issues (Pending, Lost)"),
+) -> PVCsListResponse:
+    """Return monitored PersistentVolumeClaims across namespaces."""
+    pvcs = resource_cache.get_pvcs()
+
+    if namespace:
+        pvcs = [p for p in pvcs if p.get("namespace") == namespace]
+
+    if phase:
+        pvcs = [p for p in pvcs if p.get("phase", "").lower() == phase.lower()]
+
+    if attention is not None:
+        if attention:
+            pvcs = [p for p in pvcs if not p.get("isHealthy")]
+        else:
+            pvcs = [p for p in pvcs if p.get("isHealthy")]
+
+    last_sync = resource_cache.get_last_successful_sync()
+    items = [PVCItem(**p) for p in pvcs]
+    return PVCsListResponse(
+        items=items,
+        count=len(items),
+        lastUpdated=last_sync.isoformat() if last_sync else None,
     )
 
 

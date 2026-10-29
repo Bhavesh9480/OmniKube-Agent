@@ -1,0 +1,15 @@
+apiVersion: v2
+name: omnikube-agent
+description: Ultra-lightweight Kubernetes Monitoring Agent with real-time health diagnostics, native leader election, and sub-40MB memory footprint.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+maintainers:
+  - name: Bhavesh Suthar
+    url: https://github.com/Bhavesh9480/OmniKube-Agent
+keywords:
+  - kubernetes
+  - monitoring
+  - agent
+  - lightweight
+  - observability

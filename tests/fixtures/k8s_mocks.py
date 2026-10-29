@@ -160,3 +160,116 @@ def make_mock_service(
             "ports": ports,
         },
     }
+
+
+def make_mock_node(
+    name: str = "node-1",
+    ready: bool = True,
+    memory_pressure: bool = False,
+    disk_pressure: bool = False,
+    pid_pressure: bool = False,
+    kubelet_version: str = "v1.30.0",
+    roles: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Create a mock Node dictionary structure."""
+    labels = {}
+    if roles:
+        for r in roles:
+            labels[f"node-role.kubernetes.io/{r}"] = ""
+    else:
+        labels["node-role.kubernetes.io/worker"] = ""
+
+    conditions = [
+        {
+            "type": "Ready",
+            "status": "True" if ready else "False",
+            "reason": "KubeletReady" if ready else "KubeletNotReady",
+            "message": "kubelet is posting ready status" if ready else "container runtime is down",
+        },
+        {"type": "MemoryPressure", "status": "True" if memory_pressure else "False"},
+        {"type": "DiskPressure", "status": "True" if disk_pressure else "False"},
+        {"type": "PIDPressure", "status": "True" if pid_pressure else "False"},
+    ]
+
+    return {
+        "metadata": {
+            "name": name,
+            "labels": labels,
+            "creationTimestamp": (datetime.now(timezone.utc) - timedelta(days=10)).isoformat(),
+        },
+        "status": {
+            "conditions": conditions,
+            "addresses": [
+                {"type": "InternalIP", "address": "192.168.1.10"},
+                {"type": "Hostname", "address": name},
+            ],
+            "nodeInfo": {
+                "kubeletVersion": kubelet_version,
+                "osImage": "Ubuntu 22.04.4 LTS",
+                "containerRuntimeVersion": "containerd://1.7.15",
+            },
+            "allocatable": {
+                "cpu": "8",
+                "memory": "16384Mi",
+                "pods": "110",
+            },
+        },
+    }
+
+
+def make_mock_statefulset(
+    namespace: str = "default",
+    name: str = "sts-db",
+    desired: int = 3,
+    ready: int = 3,
+    current: int = 3,
+    updated: int = 3,
+    service_name: str = "db-service",
+) -> Dict[str, Any]:
+    """Create a mock StatefulSet dictionary structure."""
+    return {
+        "metadata": {
+            "namespace": namespace,
+            "name": name,
+            "creationTimestamp": (datetime.now(timezone.utc) - timedelta(days=5)).isoformat(),
+        },
+        "spec": {
+            "serviceName": service_name,
+            "replicas": desired,
+        },
+        "status": {
+            "replicas": desired,
+            "readyReplicas": ready,
+            "currentReplicas": current,
+            "updatedReplicas": updated,
+        },
+    }
+
+
+def make_mock_pvc(
+    namespace: str = "default",
+    name: str = "data-pvc",
+    phase: str = "Bound",
+    storage_class: str = "standard",
+    volume_name: str = "pvc-vol-123",
+    storage: str = "10Gi",
+) -> Dict[str, Any]:
+    """Create a mock PersistentVolumeClaim dictionary structure."""
+    return {
+        "metadata": {
+            "namespace": namespace,
+            "name": name,
+            "creationTimestamp": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+        },
+        "spec": {
+            "storageClassName": storage_class,
+            "volumeName": volume_name,
+            "resources": {
+                "requests": {"storage": storage},
+            },
+        },
+        "status": {
+            "phase": phase,
+            "capacity": {"storage": storage},
+        },
+    }

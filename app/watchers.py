@@ -470,6 +470,15 @@ class ClusterWatcher:
 
     def _initial_sync_and_start_watchers(self) -> None:
         """Execute initial synchronization and launch watch loops in background."""
+        from app.leader import leader_manager
+
+        # Await leadership lease if leader election is enabled
+        while not self._stop_event.is_set() and not leader_manager.is_leader():
+            logger.info("Instance is standby replica. Awaiting leadership lease...")
+            time.sleep(5)
+        if self._stop_event.is_set():
+            return
+
         logger.info("Executing initial cluster synchronization in background thread.")
         try:
             self.reconcile()
@@ -541,8 +550,76 @@ class ClusterWatcher:
         parsed_events = [parse_event(e) for e in mock["events"]]
         resource_cache.set_events(parsed_events)
 
+        # Mock Pod Metrics
+        from app.collectors.metrics import parse_pod_metrics
+        mock_metric_items = [
+            {
+                "metadata": {"namespace": p["namespace"], "name": p["name"]},
+                "containers": [
+                    {"name": c["name"], "usage": {"cpu": "18m", "memory": "48Mi"}}
+                    for c in p.get("containers", [])
+                ],
+            }
+            for p in parsed_pods
+        ]
+        resource_cache.set_pod_metrics(parse_pod_metrics(mock_metric_items))
+
+        # Mock Nodes (Tier 2)
+        from app.collectors.nodes import parse_node
+        raw_mock_nodes = [
+            {
+                "metadata": {"name": "control-plane-node", "labels": {"node-role.kubernetes.io/control-plane": ""}},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "nodeInfo": {"kubeletVersion": "v1.29.2", "osImage": "Ubuntu 22.04 LTS"},
+                    "allocatable": {"cpu": "4", "memory": "16Gi", "pods": "110"},
+                },
+            },
+            {
+                "metadata": {"name": "worker-node-1", "labels": {"node-role.kubernetes.io/worker": ""}},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "nodeInfo": {"kubeletVersion": "v1.29.2", "osImage": "Ubuntu 22.04 LTS"},
+                    "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                },
+            },
+        ]
+        parsed_nodes = [parse_node(n) for n in raw_mock_nodes]
+        resource_cache.set_nodes(parsed_nodes)
+
+        # Mock StatefulSets (Tier 2)
+        from app.collectors.statefulsets import parse_statefulset
+        raw_mock_sts = [
+            {
+                "metadata": {"namespace": "production", "name": "postgres-cluster"},
+                "spec": {"replicas": 3, "serviceName": "postgres"},
+                "status": {"replicas": 3, "readyReplicas": 3, "currentReplicas": 3},
+            }
+        ]
+        parsed_sts = [parse_statefulset(s) for s in raw_mock_sts]
+        resource_cache.set_statefulsets(parsed_sts)
+
+        # Mock PersistentVolumeClaims (Tier 2)
+        from app.collectors.pvcs import parse_pvc
+        raw_mock_pvcs = [
+            {
+                "metadata": {"namespace": "production", "name": "data-postgres-cluster-0"},
+                "spec": {"storageClassName": "standard", "volumeName": "pvc-vol-001", "resources": {"requests": {"storage": "50Gi"}}},
+                "status": {"phase": "Bound", "capacity": {"storage": "50Gi"}},
+            }
+        ]
+        parsed_pvcs = [parse_pvc(p) for p in raw_mock_pvcs]
+        resource_cache.set_pvcs(parsed_pvcs)
+
         # Alert evaluation
-        alert_manager.evaluate(parsed_pods, parsed_deployments, parsed_services)
+        alert_manager.evaluate(
+            parsed_pods,
+            parsed_deployments,
+            parsed_services,
+            nodes=parsed_nodes,
+            statefulsets=parsed_sts,
+            pvcs=parsed_pvcs,
+        )
         resource_cache.set_initial_sync_completed(True)
 
     def _mock_reconciliation_loop(self) -> None:
@@ -563,11 +640,19 @@ class ClusterWatcher:
                 self._sync_mock_data()
             return
 
+        scoped_ns = settings.get_monitored_namespaces()
+        ns_desc = f"namespaces {scoped_ns}" if scoped_ns else "all namespaces"
+        logger.info("Executing cluster reconciliation across %s...", ns_desc)
+
         try:
             # 1. EndpointSlices
             if k8s_manager.discovery_v1:
-                logger.info("Fetching EndpointSlices across all namespaces...")
-                raw_slices = k8s_manager.discovery_v1.list_endpoint_slice_for_all_namespaces(_request_timeout=10).items
+                raw_slices = []
+                if scoped_ns:
+                    for ns in scoped_ns:
+                        raw_slices.extend(k8s_manager.discovery_v1.list_namespaced_endpoint_slice(ns, _request_timeout=10).items)
+                else:
+                    raw_slices = k8s_manager.discovery_v1.list_endpoint_slice_for_all_namespaces(_request_timeout=10).items
                 parsed_slices = [parse_endpointslice(s) for s in raw_slices]
                 resource_cache.set_endpointslices(parsed_slices)
                 logger.info("Fetched %d EndpointSlices.", len(parsed_slices))
@@ -576,8 +661,12 @@ class ClusterWatcher:
 
             # 2. Services
             if k8s_manager.core_v1:
-                logger.info("Fetching Services across all namespaces...")
-                raw_services = k8s_manager.core_v1.list_service_for_all_namespaces(_request_timeout=10).items
+                raw_services = []
+                if scoped_ns:
+                    for ns in scoped_ns:
+                        raw_services.extend(k8s_manager.core_v1.list_namespaced_service(ns, _request_timeout=10).items)
+                else:
+                    raw_services = k8s_manager.core_v1.list_service_for_all_namespaces(_request_timeout=10).items
                 parsed_services = [parse_service(s, parsed_slices) for s in raw_services]
                 resource_cache.set_services(parsed_services)
                 logger.info("Fetched %d Services.", len(parsed_services))
@@ -586,8 +675,12 @@ class ClusterWatcher:
 
             # 3. Deployments
             if k8s_manager.apps_v1:
-                logger.info("Fetching Deployments across all namespaces...")
-                raw_deps = k8s_manager.apps_v1.list_deployment_for_all_namespaces(_request_timeout=10).items
+                raw_deps = []
+                if scoped_ns:
+                    for ns in scoped_ns:
+                        raw_deps.extend(k8s_manager.apps_v1.list_namespaced_deployment(ns, _request_timeout=10).items)
+                else:
+                    raw_deps = k8s_manager.apps_v1.list_deployment_for_all_namespaces(_request_timeout=10).items
                 parsed_deployments = [parse_deployment(d) for d in raw_deps]
                 resource_cache.set_deployments(parsed_deployments)
                 logger.info("Fetched %d Deployments.", len(parsed_deployments))
@@ -596,8 +689,12 @@ class ClusterWatcher:
 
             # 4. Pods
             if k8s_manager.core_v1:
-                logger.info("Fetching Pods across all namespaces...")
-                raw_pods = k8s_manager.core_v1.list_pod_for_all_namespaces(_request_timeout=10).items
+                raw_pods = []
+                if scoped_ns:
+                    for ns in scoped_ns:
+                        raw_pods.extend(k8s_manager.core_v1.list_namespaced_pod(ns, _request_timeout=10).items)
+                else:
+                    raw_pods = k8s_manager.core_v1.list_pod_for_all_namespaces(_request_timeout=10).items
                 parsed_pods = [
                     parse_pod(
                         p,
@@ -613,14 +710,93 @@ class ClusterWatcher:
 
             # 5. Events
             if k8s_manager.core_v1:
-                logger.info("Fetching Events across all namespaces...")
-                raw_events = k8s_manager.core_v1.list_event_for_all_namespaces(_request_timeout=10).items
+                raw_events = []
+                if scoped_ns:
+                    for ns in scoped_ns:
+                        raw_events.extend(k8s_manager.core_v1.list_namespaced_event(ns, _request_timeout=10).items)
+                else:
+                    raw_events = k8s_manager.core_v1.list_event_for_all_namespaces(_request_timeout=10).items
                 parsed_events = [parse_event(e) for e in raw_events]
                 resource_cache.set_events(parsed_events)
                 logger.info("Fetched %d Events.", len(parsed_events))
 
+            # 6. Live Metrics (metrics.k8s.io)
+            if getattr(settings, "enable_metrics_server", True) and getattr(k8s_manager, "custom_objects", None):
+                try:
+                    raw_metrics = k8s_manager.custom_objects.list_cluster_custom_object(
+                        group="metrics.k8s.io",
+                        version="v1beta1",
+                        plural="pods",
+                        _request_timeout=5,
+                    )
+                    from app.collectors.metrics import parse_pod_metrics
+                    parsed_metrics = parse_pod_metrics(raw_metrics.get("items", []))
+                    resource_cache.set_pod_metrics(parsed_metrics)
+                    logger.debug("Fetched live metrics for %d pods.", len(parsed_metrics))
+                except Exception as ex:
+                    logger.debug("Metrics server query skipped or unavailable: %s", ex)
+
+            # 7. Nodes (Tier 2: cluster-scoped)
+            parsed_nodes = []
+            if k8s_manager.core_v1 and not scoped_ns:
+                try:
+                    from app.collectors.nodes import parse_node
+                    raw_nodes = k8s_manager.core_v1.list_node(_request_timeout=10).items
+                    parsed_nodes = [parse_node(n) for n in raw_nodes]
+                    resource_cache.set_nodes(parsed_nodes)
+                    logger.info("Fetched %d Nodes.", len(parsed_nodes))
+                except Exception as ex:
+                    logger.debug("Node query skipped or unauthorized: %s", ex)
+            else:
+                parsed_nodes = resource_cache.get_nodes()
+
+            # 8. StatefulSets (Tier 2)
+            parsed_sts = []
+            if k8s_manager.apps_v1:
+                try:
+                    from app.collectors.statefulsets import parse_statefulset
+                    raw_sts = []
+                    if scoped_ns:
+                        for ns in scoped_ns:
+                            raw_sts.extend(k8s_manager.apps_v1.list_namespaced_stateful_set(ns, _request_timeout=10).items)
+                    else:
+                        raw_sts = k8s_manager.apps_v1.list_stateful_set_for_all_namespaces(_request_timeout=10).items
+                    parsed_sts = [parse_statefulset(s) for s in raw_sts]
+                    resource_cache.set_statefulsets(parsed_sts)
+                    logger.info("Fetched %d StatefulSets.", len(parsed_sts))
+                except Exception as ex:
+                    logger.debug("StatefulSet query skipped or unauthorized: %s", ex)
+            else:
+                parsed_sts = resource_cache.get_statefulsets()
+
+            # 9. PersistentVolumeClaims (Tier 2)
+            parsed_pvcs = []
+            if k8s_manager.core_v1:
+                try:
+                    from app.collectors.pvcs import parse_pvc
+                    raw_pvcs = []
+                    if scoped_ns:
+                        for ns in scoped_ns:
+                            raw_pvcs.extend(k8s_manager.core_v1.list_namespaced_persistent_volume_claim(ns, _request_timeout=10).items)
+                    else:
+                        raw_pvcs = k8s_manager.core_v1.list_persistent_volume_claim_for_all_namespaces(_request_timeout=10).items
+                    parsed_pvcs = [parse_pvc(p) for p in raw_pvcs]
+                    resource_cache.set_pvcs(parsed_pvcs)
+                    logger.info("Fetched %d PersistentVolumeClaims.", len(parsed_pvcs))
+                except Exception as ex:
+                    logger.debug("PVC query skipped or unauthorized: %s", ex)
+            else:
+                parsed_pvcs = resource_cache.get_pvcs()
+
             # Evaluate alerts
-            alert_manager.evaluate(parsed_pods, parsed_deployments, parsed_services)
+            alert_manager.evaluate(
+                parsed_pods,
+                parsed_deployments,
+                parsed_services,
+                nodes=parsed_nodes,
+                statefulsets=parsed_sts,
+                pvcs=parsed_pvcs,
+            )
             resource_cache.set_initial_sync_completed(True)
             logger.info("Cluster reconciliation completed successfully.")
 
@@ -630,11 +806,16 @@ class ClusterWatcher:
 
     def _periodic_reconciliation_loop(self) -> None:
         """Periodic background reconciliation to guarantee eventual consistency."""
+        from app.leader import leader_manager
+
         while not self._stop_event.is_set():
             time.sleep(settings.reconciliation_interval_seconds)
             if self._stop_event.is_set():
                 break
-            self.reconcile()
+            if leader_manager.is_leader():
+                self.reconcile()
+            else:
+                logger.debug("Reconciliation skipped: instance is hot standby replica.")
 
     def _watch_pods(self) -> None:
         """Watch loop for Pods with automatic reconnect and 410 handling."""

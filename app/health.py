@@ -4,6 +4,7 @@ from typing import Any, Dict, Tuple
 from app.cache import resource_cache
 from app.config import settings
 from app.kubernetes_client import k8s_manager
+from app.leader import leader_manager
 
 
 def check_liveness() -> Dict[str, str]:
@@ -92,4 +93,14 @@ def get_detailed_health(watcher_status: Dict[str, str]) -> Dict[str, Any]:
         },
         "watchers": watcher_status,
         "syncErrors": resource_cache.get_sync_errors(),
+        "leader": {
+            "enabled": settings.enable_leader_election,
+            "isLeader": leader_manager.is_leader(),
+            "holderIdentity": (
+                leader_manager.get_leader_identity()
+                if settings.enable_leader_election
+                else "singleton"
+            ),
+        },
+        "scopedNamespaces": settings.get_monitored_namespaces(),
     }

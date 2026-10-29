@@ -48,6 +48,10 @@ class SummaryResponse(BaseModel):
     deployments: DeploymentsSummary
     services: ServicesSummary
     alerts: AlertsSummary
+    liveMetrics: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Cluster-wide live CPU and Memory totals from metrics.k8s.io if available",
+    )
 
 
 # --- Pods Schemas ---
@@ -80,6 +84,10 @@ class PodItem(BaseModel):
     deletionTimestamp: Optional[str] = None
     isTerminating: Optional[bool] = False
     isUnhealthy: Optional[bool] = False
+    metrics: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Live CPU and Memory utilization from metrics.k8s.io if available",
+    )
 
 
 class PodsListResponse(BaseModel):
@@ -125,6 +133,14 @@ class AlertItem(BaseModel):
     firstSeen: str
     lastSeen: str
     status: Literal["active", "resolved"]
+    lastLogSnippet: Optional[str] = Field(
+        default=None,
+        description="Recent crash log snippet if available from terminated container",
+    )
+    pendingResolve: Optional[bool] = Field(
+        default=None,
+        description="True if alert is currently within the anti-flapping cooldown window",
+    )
 
 
 class AlertsListResponse(BaseModel):
@@ -152,6 +168,74 @@ class DetailedHealthResponse(BaseModel):
     cache: Dict[str, Any]
     watchers: Dict[str, str]
     syncErrors: Dict[str, str]
+    leader: Optional[Dict[str, Any]] = None
+    scopedNamespaces: Optional[List[str]] = None
+
+
+# --- Nodes Schemas ---
+
+class NodeItem(BaseModel):
+    name: str
+    ready: bool
+    isHealthy: bool = True
+    roles: List[str] = Field(default_factory=list)
+    internalIP: Optional[str] = None
+    hostname: Optional[str] = None
+    kubeletVersion: Optional[str] = "unknown"
+    osImage: Optional[str] = "unknown"
+    containerRuntime: Optional[str] = "unknown"
+    allocatable: Optional[Dict[str, str]] = Field(default_factory=dict)
+    pressures: List[str] = Field(default_factory=list)
+    issues: List[Dict[str, Any]] = Field(default_factory=list)
+    createdAt: Optional[str] = None
+
+
+class NodesListResponse(BaseModel):
+    items: List[NodeItem]
+    count: int
+    lastUpdated: Optional[str] = None
+
+
+# --- StatefulSets Schemas ---
+
+class StatefulSetItem(BaseModel):
+    namespace: str
+    name: str
+    serviceName: Optional[str] = ""
+    desired: int = 1
+    current: int = 0
+    ready: int = 0
+    updated: int = 0
+    isHealthy: bool = True
+    issues: List[Dict[str, Any]] = Field(default_factory=list)
+    createdAt: Optional[str] = None
+
+
+class StatefulSetsListResponse(BaseModel):
+    items: List[StatefulSetItem]
+    count: int
+    lastUpdated: Optional[str] = None
+
+
+# --- PersistentVolumeClaims Schemas ---
+
+class PVCItem(BaseModel):
+    namespace: str
+    name: str
+    phase: str
+    storageClass: Optional[str] = ""
+    volumeName: Optional[str] = ""
+    requestedStorage: Optional[str] = "unknown"
+    capacity: Optional[str] = "unknown"
+    isHealthy: bool = True
+    issues: List[Dict[str, Any]] = Field(default_factory=list)
+    createdAt: Optional[str] = None
+
+
+class PVCsListResponse(BaseModel):
+    items: List[PVCItem]
+    count: int
+    lastUpdated: Optional[str] = None
 
 
 # --- Services & EndpointSlices Schemas ---

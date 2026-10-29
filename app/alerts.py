@@ -2,11 +2,78 @@
 
 import hashlib
 import logging
+import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional
 
+from app.config import settings
+from app.kubernetes_client import k8s_manager
+from app.notifications import dispatch_webhook
+
 logger = logging.getLogger(__name__)
+
+
+def fetch_crash_log_snippet(
+    namespace: str,
+    pod_name: str,
+    container_name: Optional[str] = None,
+    tail_lines: int = 20,
+) -> Optional[str]:
+    """Fetch recent log lines from a crashed or failing container.
+
+    Zero-dependency, uses official Kubernetes client.
+    First attempts previous=True (terminated instance), then falls back to previous=False.
+    """
+    if not getattr(settings, "enable_crash_logs", True):
+        return None
+
+    if getattr(k8s_manager, "is_mock", False):
+        return (
+            "[ERROR] Fatal exception in worker process\n"
+            "Database connection failed at postgres.internal:5432 (timeout after 30s)\n"
+            "Process terminated with exit code 1"
+        )
+
+    core_v1 = getattr(k8s_manager, "core_v1", None)
+    if not core_v1:
+        return None
+
+    # Try fetching terminated instance logs first
+    try:
+        kwargs: Dict[str, Any] = {
+            "name": pod_name,
+            "namespace": namespace,
+            "tail_lines": tail_lines,
+            "previous": True,
+            "_request_timeout": 3,
+        }
+        if container_name:
+            kwargs["container"] = container_name
+        logs = core_v1.read_namespaced_pod_log(**kwargs)
+        if logs and str(logs).strip():
+            return str(logs).strip()[-1500:]
+    except Exception:
+        pass
+
+    # Fallback to current container logs
+    try:
+        kwargs = {
+            "name": pod_name,
+            "namespace": namespace,
+            "tail_lines": tail_lines,
+            "previous": False,
+            "_request_timeout": 3,
+        }
+        if container_name:
+            kwargs["container"] = container_name
+        logs = core_v1.read_namespaced_pod_log(**kwargs)
+        if logs and str(logs).strip():
+            return str(logs).strip()[-1500:]
+    except Exception:
+        pass
+
+    return None
 
 
 def generate_alert_id(rule: str, kind: str, namespace: str, name: str) -> str:
@@ -18,12 +85,18 @@ def generate_alert_id(rule: str, kind: str, namespace: str, name: str) -> str:
 class AlertManager:
     """Manages active and resolved alerts with thread-safe deduplication."""
 
-    def __init__(self, history_limit: int = 500):
+    def __init__(self, history_limit: int = 500, flapping_cooldown_seconds: Optional[int] = None):
         self.history_limit = history_limit
+        if flapping_cooldown_seconds is not None:
+            self.flapping_cooldown_seconds = flapping_cooldown_seconds
+        else:
+            self.flapping_cooldown_seconds = getattr(settings, "alert_flapping_cooldown_seconds", 0)
         # Key: alert_id -> alert dictionary
         self._active_alerts: Dict[str, Dict[str, Any]] = {}
         # Bounded queue of resolved alerts
         self._resolved_alerts: Deque[Dict[str, Any]] = deque(maxlen=history_limit)
+        # Key: alert_id -> timestamp when issue was first no longer detected
+        self._pending_resolutions: Dict[str, float] = {}
 
     def _broadcast(self, fn) -> None:
         try:
@@ -37,6 +110,9 @@ class AlertManager:
         pods: List[Dict[str, Any]],
         deployments: List[Dict[str, Any]],
         services: List[Dict[str, Any]],
+        nodes: Optional[List[Dict[str, Any]]] = None,
+        statefulsets: Optional[List[Dict[str, Any]]] = None,
+        pvcs: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Run evaluation rules across current cached resources.
         
@@ -93,6 +169,16 @@ class AlertManager:
 
                 if rule:
                     a_id = generate_alert_id(rule, "Pod", ns, name)
+                    log_snippet = None
+                    if issue_type in ("CrashLoopBackOff", "ContainerTerminatedError", "PodFailed"):
+                        c_name = issue.get("container")
+                        log_snippet = fetch_crash_log_snippet(
+                            namespace=ns,
+                            pod_name=name,
+                            container_name=c_name,
+                            tail_lines=getattr(settings, "crash_log_tail_lines", 20),
+                        )
+
                     detected_alerts[a_id] = {
                         "id": a_id,
                         "severity": severity,
@@ -102,6 +188,7 @@ class AlertManager:
                         "namespace": ns,
                         "reason": issue_type,
                         "message": msg,
+                        "lastLogSnippet": log_snippet,
                     }
 
         # 2. Evaluate Deployments
@@ -164,12 +251,82 @@ class AlertManager:
                         "message": issue.get("message", "Service has no ready endpoints"),
                     }
 
+        # 4. Evaluate Nodes (Tier 2)
+        for node in (nodes or []):
+            name = node.get("name", "unknown")
+            for issue in node.get("issues", []):
+                issue_type = issue.get("type", "")
+                msg = issue.get("message", "")
+                severity = "critical" if issue_type == "NodeNotReady" else "warning"
+                rule = issue_type
+
+                a_id = generate_alert_id(rule, "Node", "cluster", name)
+                detected_alerts[a_id] = {
+                    "id": a_id,
+                    "severity": severity,
+                    "title": f"Node {name}: {issue_type}",
+                    "resourceKind": "Node",
+                    "resourceName": name,
+                    "namespace": "cluster",
+                    "reason": issue_type,
+                    "message": msg,
+                }
+
+        # 5. Evaluate StatefulSets (Tier 2)
+        for sts in (statefulsets or []):
+            ns = sts.get("namespace", "default")
+            name = sts.get("name", "unknown")
+            for issue in sts.get("issues", []):
+                issue_type = issue.get("type", "")
+                msg = issue.get("message", "")
+                rule = "StatefulSetReplicaShortage"
+                severity = "warning"
+
+                a_id = generate_alert_id(rule, "StatefulSet", ns, name)
+                detected_alerts[a_id] = {
+                    "id": a_id,
+                    "severity": severity,
+                    "title": f"StatefulSet {name} replica shortage",
+                    "resourceKind": "StatefulSet",
+                    "resourceName": name,
+                    "namespace": ns,
+                    "reason": issue_type,
+                    "message": msg,
+                }
+
+        # 6. Evaluate PersistentVolumeClaims (Tier 2)
+        for pvc in (pvcs or []):
+            ns = pvc.get("namespace", "default")
+            name = pvc.get("name", "unknown")
+            for issue in pvc.get("issues", []):
+                issue_type = issue.get("type", "")
+                msg = issue.get("message", "")
+                severity = "critical" if issue_type == "PVCLost" else "warning"
+                rule = issue_type
+
+                a_id = generate_alert_id(rule, "PersistentVolumeClaim", ns, name)
+                detected_alerts[a_id] = {
+                    "id": a_id,
+                    "severity": severity,
+                    "title": f"PVC {name}: {issue_type}",
+                    "resourceKind": "PersistentVolumeClaim",
+                    "resourceName": name,
+                    "namespace": ns,
+                    "reason": issue_type,
+                    "message": msg,
+                }
+
         # Update active alerts and deduplicate
         for a_id, a_data in detected_alerts.items():
             if a_id in self._active_alerts:
                 # Update lastSeen and refresh message
                 self._active_alerts[a_id]["lastSeen"] = now
                 self._active_alerts[a_id]["message"] = a_data["message"]
+                if a_data.get("lastLogSnippet") and not self._active_alerts[a_id].get("lastLogSnippet"):
+                    self._active_alerts[a_id]["lastLogSnippet"] = a_data["lastLogSnippet"]
+                # Flapping recovery: clear any pending resolution
+                self._pending_resolutions.pop(a_id, None)
+                self._active_alerts[a_id].pop("pendingResolve", None)
             else:
                 # New alert
                 new_alert = {
@@ -180,15 +337,32 @@ class AlertManager:
                 }
                 self._active_alerts[a_id] = new_alert
                 self._broadcast(lambda b: b.broadcast_alert_event("alert_created", new_alert))
+                dispatch_webhook("alert_created", new_alert, getattr(settings, "alert_webhook_url", None))
 
-        # Auto-resolve alerts that are no longer detected
-        resolved_ids = [aid for aid in self._active_alerts if aid not in detected_alerts]
-        for aid in resolved_ids:
+        # Auto-resolve alerts that are no longer detected (with anti-flapping protection)
+        absent_ids = [aid for aid in list(self._active_alerts.keys()) if aid not in detected_alerts]
+        now_ts = time.time()
+
+        for aid in absent_ids:
+            if self.flapping_cooldown_seconds > 0:
+                if aid not in self._pending_resolutions:
+                    self._pending_resolutions[aid] = now_ts
+                    self._active_alerts[aid]["pendingResolve"] = True
+                    continue
+                else:
+                    elapsed = now_ts - self._pending_resolutions[aid]
+                    if elapsed < self.flapping_cooldown_seconds:
+                        continue
+                    # Cooldown window expired, proceed with resolution
+                    self._pending_resolutions.pop(aid, None)
+
             alert = self._active_alerts.pop(aid)
+            alert.pop("pendingResolve", None)
             alert["status"] = "resolved"
             alert["lastSeen"] = now
             self._resolved_alerts.appendleft(alert)
             self._broadcast(lambda b: b.broadcast_alert_event("alert_resolved", alert))
+            dispatch_webhook("alert_resolved", alert, getattr(settings, "alert_webhook_url", None))
             logger.info("Resolved alert %s (%s)", aid, alert["title"])
 
     def get_alerts(
@@ -231,6 +405,7 @@ class AlertManager:
         """Clear all active and resolved alerts."""
         self._active_alerts.clear()
         self._resolved_alerts.clear()
+        self._pending_resolutions.clear()
 
 
 # Global alert manager instance

@@ -1,0 +1,98 @@
+# Default values for omnikube-agent.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/bhavesh9480/omnikube-agent
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 9999
+  targetPort: 9999
+
+# Agent configuration options
+config:
+  appMode: "production"
+  logLevel: "INFO"
+  reconciliationIntervalSeconds: 30
+  eventBufferMaxAgeMinutes: 60
+  cacheStaleThresholdSeconds: 90
+  
+  # Scoped namespace monitoring: comma-separated list (e.g. "default,production")
+  # Leave empty ("") to monitor all accessible namespaces
+  watchNamespaces: ""
+  
+  # High Availability Leader Election via Kubernetes native coordination.k8s.io Leases
+  leaderElection:
+    enabled: false
+    leaseName: "omnikube-agent-leader"
+    durationSeconds: 15
+
+# RBAC Configuration
+rbac:
+  create: true
+  # clusterWide=true deploys a ClusterRole and ClusterRoleBinding
+  # clusterWide=false deploys a Role and RoleBinding restricted to release namespace
+  clusterWide: true
+
+# NetworkPolicy enforcement
+networkPolicy:
+  enabled: true
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 64Mi
+  requests:
+    cpu: 20m
+    memory: 24Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 9999
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 9999
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

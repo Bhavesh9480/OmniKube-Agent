@@ -330,6 +330,11 @@ def test_api_events_and_metrics_endpoints():
     assert m_data["configured"] is False
     assert "not configured" in m_data["message"].lower()
 
+    # Live pod metrics endpoint
+    r_pod_metrics = client.get("/api/metrics/pods")
+    assert r_pod_metrics.status_code == 200
+    assert r_pod_metrics.json()["source"] == "metrics.k8s.io/v1beta1"
+
 
 def test_websocket_stream_snapshot_and_ping():
     """Verify WebSocket /api/ws connects, receives snapshot, and responds to ping."""
@@ -347,4 +352,46 @@ def test_websocket_stream_snapshot_and_ping():
         ws.send_text("ping")
         pong_msg = ws.receive_text()
         assert json.loads(pong_msg)["type"] == "pong"
+
+
+def test_api_tier2_nodes_statefulsets_pvcs():
+    """Verify GET /api/nodes, GET /api/statefulsets, GET /api/pvcs."""
+    from app.collectors.nodes import parse_node
+    from app.collectors.pvcs import parse_pvc
+    from app.collectors.statefulsets import parse_statefulset
+    from tests.fixtures.k8s_mocks import (
+        make_mock_node,
+        make_mock_pvc,
+        make_mock_statefulset,
+    )
+
+    node = parse_node(make_mock_node(name="node-test-1", ready=True))
+    sts = parse_statefulset(make_mock_statefulset(name="sts-test-1", desired=3, ready=1))
+    pvc = parse_pvc(make_mock_pvc(name="pvc-test-1", phase="Pending"))
+
+    resource_cache.set_nodes([node])
+    resource_cache.set_statefulsets([sts])
+    resource_cache.set_pvcs([pvc])
+
+    # Nodes
+    r_nodes = client.get("/api/nodes")
+    assert r_nodes.status_code == 200
+    n_data = r_nodes.json()
+    assert n_data["count"] == 1
+    assert n_data["items"][0]["name"] == "node-test-1"
+
+    # StatefulSets with attention filter
+    r_sts = client.get("/api/statefulsets?attention=true")
+    assert r_sts.status_code == 200
+    s_data = r_sts.json()
+    assert s_data["count"] == 1
+    assert s_data["items"][0]["name"] == "sts-test-1"
+
+    # PVCs with phase filter
+    r_pvcs = client.get("/api/pvcs?phase=Pending")
+    assert r_pvcs.status_code == 200
+    p_data = r_pvcs.json()
+    assert p_data["count"] == 1
+    assert p_data["items"][0]["name"] == "pvc-test-1"
+
 
