@@ -204,7 +204,7 @@ pip install -r requirements-dev.txt
 ```
 
 ### 3. Run Automated Unit Tests
-The test suite contains **37 comprehensive tests** validating collectors, alert deduplication, auto-resolution, cache concurrency, and all REST/WebSocket endpoints offline:
+The test suite contains **60 comprehensive tests** validating collectors, alert deduplication, auto-resolution, cache concurrency, Tier 2 collectors (Nodes, StatefulSets, PVCs), Lease-based leader election, and all REST/WebSocket endpoints offline:
 ```bash
 pytest -v
 ```
@@ -217,7 +217,14 @@ APP_MODE=mock uvicorn app.main:app --host 0.0.0.0 --port 9999 --reload
 Access the local APIs:
 - Interactive Swagger UI: `http://localhost:9999/docs`
 - Summary: `http://localhost:9999/api/summary`
+- Nodes: `http://localhost:9999/api/nodes`
 - Health: `http://localhost:9999/api/health`
+
+### 5. Run Locally Against Real Kubernetes (`local-cluster` Mode)
+Run the agent directly from your local terminal or VM host against any real Kubernetes cluster using your active `~/.kube/config` (no container build required):
+```bash
+APP_MODE=local-cluster uvicorn app.main:app --host 0.0.0.0 --port 9999 --reload
+```
 
 ---
 
@@ -237,6 +244,13 @@ minikube image build -t k8s-monitoring-agent:1.0.0 .
 docker build -t k8s-monitoring-agent:1.0.0 .
 docker tag k8s-monitoring-agent:1.0.0 <your-registry>/k8s-monitoring-agent:1.0.0
 docker push <your-registry>/k8s-monitoring-agent:1.0.0
+```
+
+#### Option C: Direct Containerd Import (Master Node Local Testing)
+When building locally with Docker on a Kubernetes master node without a remote registry, import the image directly into containerd's `k8s.io` namespace:
+```bash
+docker build -t k8s-monitoring-agent:1.0.0 .
+docker save k8s-monitoring-agent:1.0.0 | ctr -n k8s.io images import -
 ```
 
 ### 2. Deploy Manifests to Kubernetes
@@ -270,17 +284,25 @@ kubectl logs -l app.kubernetes.io/name=k8s-monitoring-agent -f
 ## Security Hardening & RBAC
 
 ### Least-Privilege Read-Only RBAC
-The agent is bound to a `ClusterRole` with **only read verbs** (`get`, `list`, `watch`):
-- Core: `pods`, `services`, `events`
-- Apps: `deployments`
-- Discovery: `endpointslices`
+The agent is bound to a `ClusterRole` with strictly scoped read operations (`get`, `list`, `watch`):
+- **Core API Group (`""`)**: `pods`, `services`, `events`, `nodes`, `persistentvolumeclaims`
+- **Apps API Group (`"apps"`)**: `deployments`, `statefulsets`
+- **Discovery API Group (`"discovery.k8s.io"`)**: `endpointslices`
+- **Coordination API Group (`"coordination.k8s.io"`)**: `leases` (for HA leader election)
+- **Subresources**: `pods/log` (read-only tailing for crash diagnostics)
+- **Metrics API (`"metrics.k8s.io"`)**: `pods`, `nodes` (live CPU/RAM)
 
-It has **zero write, create, patch, delete, or exec permissions**, and cannot read sensitive resources such as Secrets or ConfigMaps.
+It has **zero write, create, patch, delete, or exec permissions** on workloads, and cannot read sensitive resources such as Secrets or ConfigMaps.
+
+> [!NOTE]
+> **Scoped Namespace Mode**: In multi-tenant clusters where `ClusterRole` is prohibited, deploy [`k8s/rbac-namespaced.yaml`](k8s/rbac-namespaced.yaml) to restrict permissions strictly to namespaces defined in `WATCH_NAMESPACES`.
 
 Verify RBAC rules using `kubectl auth can-i`:
 ```bash
 # Allowed read operations (returns 'yes'):
 kubectl auth can-i list pods --as=system:serviceaccount:default:k8s-monitoring-agent
+kubectl auth can-i list nodes --as=system:serviceaccount:default:k8s-monitoring-agent
+kubectl auth can-i list statefulsets --as=system:serviceaccount:default:k8s-monitoring-agent
 kubectl auth can-i list deployments --as=system:serviceaccount:default:k8s-monitoring-agent
 
 # Blocked write operations (returns 'no'):
@@ -420,6 +442,42 @@ helm install omnikube-agent ./charts/omnikube-agent \
   --set rbac.clusterWide=false \
   --set config.watchNamespaces="default,production"
 ```
+
+---
+
+## Enabling Kubernetes Metrics Server (`metrics.k8s.io`)
+
+To enable live CPU millicores and memory utilization metrics in the agent and dashboard:
+
+```bash
+# 1. Deploy the official Metrics Server components
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# 2. Patch deployment with --kubelet-insecure-tls (standard for self-managed/kubeadm clusters)
+kubectl patch deployment metrics-server -n kube-system --type='json' \
+  -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+
+# 3. Verify metrics are active
+kubectl top nodes
+kubectl top pods -A
+```
+
+---
+
+## Teardown & One-Command Cleanup
+
+To remove the agent, associated RBAC manifests, Metrics Server, and local container images in a single step, run the bundled cleanup script:
+
+```bash
+chmod +x cleanup.sh
+./cleanup.sh
+```
+
+The script automatically:
+1. Terminates active port-forwarding processes on port `9999`.
+2. Deletes all OmniKube Agent Kubernetes manifests (`Service`, `Deployment`, `ClusterRole`, `ServiceAccount`).
+3. Deletes Metrics Server from `kube-system`.
+4. Removes local Docker and Containerd (`k8s.io` namespace) container images.
 
 ---
 
